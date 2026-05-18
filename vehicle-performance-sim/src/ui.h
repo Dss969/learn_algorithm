@@ -42,19 +42,21 @@ int ui_main_menu(void);
 /* ---- 仪表盘 ----
  * 在屏幕坐标 (cx, cy) 处绘制半径 radius 的圆形仪表盘。
  *   speed_kmh —— 当前车速 km/h（0~260），控制指针角度
- *   rpm       —— 估算转速（显示用），控制转速表指针
+ *   rpm       —— 估算转速（显示用）
  */
 void ui_draw_speedometer(float speed_kmh, float rpm, int cx, int cy, int radius);
 
 /* ---- 简笔侧视车 ----
- * 在 (x, y) 处绘制宽约 160px 的矩形车体 + 圆形车轮，先占位，后期可换位图。
+ * 在 (x, y) 处绘制宽约 160px 的矩形车体 + 圆形车轮。
  */
 void ui_draw_car_side(int x, int y, COLORREF color);
 
 /* ---- 跑道背景 ----
- * 在矩形区域 (x, y, w, h) 内绘制简单跑道（灰色地面 + 白色虚线）。
+ * 在矩形区域 (x, y, w, h) 内绘制跑道（灰色地面 + 白色虚线）。
+ * dash_offset: 中心虚线的水平滚动偏移（像素），实现路面流动效果；
+ *              静止画面传 0 即可。
  */
-void ui_draw_track(int x, int y, int w, int h);
+void ui_draw_track(int x, int y, int w, int h, int dash_offset);
 
 /* ---- v-t 曲线 ----
  * 在区域 (ox, oy) 为左下角、宽 w 高 h 的矩形内绘制速度-时间曲线。
@@ -62,6 +64,7 @@ void ui_draw_track(int x, int y, int w, int h);
  *   count   —— 有效数据点数
  *   dt      —— 时间步长（s），用于计算横轴刻度
  *   color   —— 曲线颜色
+ * Y 轴自动缩放到数据最大值向上取整到 20 km/h 倍数。
  */
 void ui_draw_vt_curve(float v_arr[], int count, float dt, COLORREF color,
                       int ox, int oy, int w, int h);

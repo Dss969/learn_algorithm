@@ -10,19 +10,20 @@
 #include "ui.h"
 #include <stdio.h>
 #include <string.h>
-#include <conio.h>    /* _getch() */
 #include <windows.h>  /* Sleep() */
 
 /* ============================================================ */
-/* 内部辅助：屏幕任意位置显示提示文字 + 等待按键 */
+/* 内部辅助：屏幕任意位置显示提示文字 + 等待任意键             */
 /* ============================================================ */
-static void wait_any_key(const char *msg)
+static void wait_any_key(const char *hint)
 {
+    ExMessage msg;
     settextstyle(18, 0, "宋体");
-    settextcolor(RGB(120, 120, 145));
-    outtextxy(50, WIN_HEIGHT - 36, msg ? msg : "按任意键返回主菜单...");
+    settextcolor(RGB(110, 110, 140));
+    outtextxy(50, WIN_HEIGHT - 36, hint ? hint : "按任意键返回主菜单...");
     FlushBatchDraw();
-    _getch();
+    flushmessage(EM_KEY);
+    getmessage(&msg, EM_KEY);   /* 阻塞直到任意按键 */
 }
 
 /* ============================================================ */
@@ -40,11 +41,8 @@ void sim_accel(Car *car, AccelResult *out)
     while (t < SIM_MAX_TIME && out->steps < SIM_MAX_STEPS) {
         a = physics_acceleration(car, v);
 
-        /* 已到极限车速（驱动力 ≤ 阻力），进入匹速巡航 */
-        if (a <= 0.0f) {
-            /* 不记录更多点，直接结束 */
-            break;
-        }
+        /* 已到极限车速（驱动力 ≤ 阻力），结束仿真 */
+        if (a <= 0.0f) break;
 
         /* 速度积分：v(t+dt) = v(t) + a·dt */
         v += a * DT;
@@ -70,7 +68,7 @@ void sim_brake(Car *car, BrakeResult *out)
     memset(out, 0, sizeof(BrakeResult));
 
     /*
-     * 制动动学：v(t+dt) = v(t) − a_brake·dt
+     * 制动运动学：v(t+dt) = v(t) − a_brake·dt
      * 位移积分：s(t+dt) = s(t) + v(t+dt)·dt
      */
     while (v > 0.0f && out->steps < SIM_MAX_STEPS) {
@@ -94,21 +92,26 @@ void sim_run_accel(Car cars[], int car_count)
     AccelResult result;
     int   idx, step;
     float v_kmh, rpm;
-    float dist = 0.0f;   /* 跑过的路程 m */
     char  buf[64];
 
     /* 跑道区域（屏幕右半底部） */
     int   trk_x = 520, trk_y = 340, trk_w = 720, trk_h = 280;
-    /* 车在跑道上的 Y 坐标（路面中齐） */
-    int   car_y  = trk_y + trk_h / 2 - 45;
-    /* 屏幕每像素代表的路程（m），100m 映射到跑道宽度 */
-    float px_per_m = (float)trk_w / 100.0f;
+    /* 车固定在跑道左侧 1/3 处，路面向左流动制造前进感 */
+    int   car_y      = trk_y + trk_h / 2 - 45;
+    int   car_draw_x = trk_x + 60;
+
+    /*
+     * dash_offset: 路面虚线的累计滚动像素偏移。
+     * 每帧按 v·dt·scale 递增，scale=6 使低速时虚线移动也清晰可见。
+     * ui_draw_track 对 40px 取模后绘制，保证无跳变。
+     */
+    float dash_offset = 0.0f;
 
     /* 选车 */
     idx = ui_select_car(cars, car_count);
     if (idx < 0) return;
 
-    /* 运行物理仿真 */
+    /* 运行物理仿真（先算完所有步骤，再逐帧回放动画） */
     sim_accel(&cars[idx], &result);
 
     /* ---- 帧循环重放动画 ---- */
@@ -120,9 +123,12 @@ void sim_run_accel(Car cars[], int car_count)
               * cars[idx].gear_ratio * 60.0f / (2.0f * 3.14159f);
         if (rpm > 8000.0f) rpm = 8000.0f;
 
-        /* 累计位移（循环显示：超过跑道宽度则回绕） */
-        dist += result.v_arr[step] * DT;
-        while (dist > 100.0f) dist -= 100.0f;
+        /*
+         * 路面滚动偏移：v(m/s) × dt(s) × scale(px/m)
+         * scale=6 意味着 1 m 实际位移对应 6px 虚线移动。
+         * 偏移不做 100m 回绕，而是交给 ui_draw_track 内部对 40 取模。
+         */
+        dash_offset += result.v_arr[step] * DT * 6.0f;
 
         ui_begin_frame();
 
@@ -148,10 +154,9 @@ void sim_run_accel(Car cars[], int car_count)
                  physics_acceleration(&cars[idx], result.v_arr[step]));
         outtextxy(30, WIN_HEIGHT - 76, buf);
 
-        /* 右侧：跑道 + 车辆 */
-        ui_draw_track(trk_x, trk_y, trk_w, trk_h);
-        ui_draw_car_side(trk_x + (int)(dist * px_per_m),
-                         car_y, g_car_colors[0]);
+        /* 右侧：跑道（路面虚线滚动）+ 车固定在左侧 */
+        ui_draw_track(trk_x, trk_y, trk_w, trk_h, (int)dash_offset);
+        ui_draw_car_side(car_draw_x, car_y, g_car_colors[0]);
 
         /* 破百后显示标志 */
         if (result.t100 > 0.0f && step * DT >= result.t100) {
@@ -218,9 +223,17 @@ void sim_run_brake(Car cars[], int car_count)
     outtextxy(30, 60, "制动测试 — 初始车速: 100 km/h");
     settextcolor(RGB(120, 120, 145));
     outtextxy(30, WIN_HEIGHT - 50, "按 【空格】 开始制动");
-    ui_draw_track(trk_x, trk_y, trk_w, trk_h);
+    ui_draw_track(trk_x, trk_y, trk_w, trk_h, 0);
     ui_draw_car_side(trk_x + 20, car_y, g_car_colors[1]);
-    wait_any_key("按空格开始制动...");
+    FlushBatchDraw();
+
+    /* 明确等待空格键，避免误触其它按键直接跳过 */
+    {
+        ExMessage msg;
+        flushmessage(EM_KEY);
+        do { getmessage(&msg, EM_KEY); }
+        while (!(msg.message == WM_KEYDOWN && msg.vkcode == VK_SPACE));
+    }
 
     /* --- 运行制动仿真 --- */
     sim_brake(&cars[idx], &result);
@@ -246,7 +259,7 @@ void sim_run_brake(Car cars[], int car_count)
         settextcolor(RGB(100, 200, 255));
         outtextxy(30, 58, buf);
 
-        ui_draw_track(trk_x, trk_y, trk_w, trk_h);
+        ui_draw_track(trk_x, trk_y, trk_w, trk_h, 0);
         ui_draw_car_side(trk_x + (int)(result.s_arr[step] * px_per_m),
                          car_y, g_car_colors[1]);
         ui_end_frame();
@@ -305,7 +318,7 @@ void sim_run_comparison(Car cars[], int car_count)
     while (n < 3) {
         int idx = ui_select_car(cars, car_count);
         if (idx < 0 && n >= 2) break;   /* Esc 且已选了两车 */
-        if (idx < 0 && n < 2)  continue; /* 不足两车时继续选 */
+        if (idx < 0 && n < 2)  continue;
 
         sel_idx[n]  = idx;
         sel_cars[n] = cars[idx];
@@ -320,7 +333,6 @@ void sim_run_comparison(Car cars[], int car_count)
 
         t100[i]       = accel[i].t100;
         brake_dist[i] = brake[i].total_dist;
-        /* 最高车速：取仿真最后一步的速度 */
         vmax[i] = (accel[i].steps > 0)
                   ? accel[i].v_arr[accel[i].steps - 1]
                   : 0.0f;
@@ -334,7 +346,6 @@ void sim_run_comparison(Car cars[], int car_count)
     outtextxy(50, 18, "车型对比 — v-t 曲线");
 
     for (i = 0; i < n; i++) {
-        /* 每辆车用不同颜色叠在同一层 */
         ui_draw_vt_curve(accel[i].v_arr, accel[i].steps, DT,
                          g_car_colors[i],
                          90, WIN_HEIGHT - 210,
@@ -344,7 +355,6 @@ void sim_run_comparison(Car cars[], int car_count)
     ui_draw_comparison_legend(sel_cars, n, g_car_colors);
     ui_draw_comparison_table(sel_cars, t100, brake_dist, vmax, n);
 
-    /* 简明标题提示 */
     settextstyle(17, 0, "宋体");
     for (i = 0; i < n; i++) {
         settextcolor(g_car_colors[i]);
@@ -363,8 +373,8 @@ void sim_run_comparison(Car cars[], int car_count)
 /* ============================================================ */
 void sim_run_car_manager(Car cars[], int *car_count)
 {
-    int  ch, del_idx;
     char buf[128];
+    ExMessage msg;
 
     while (1) {
         int i;
@@ -407,47 +417,53 @@ void sim_run_car_manager(Car cars[], int *car_count)
 
         ui_end_frame();
 
-        ch = _getch();
+        /*
+         * 阻塞等待按键。
+         * VK 码大写字母不区分 Shift：'a' 和 'A' 的 vkcode 都是 0x41='A'。
+         * 用 WM_KEYDOWN + vkcode 比 WM_CHAR + ch 更可靠（中文输入法不干扰）。
+         */
+        flushmessage(EM_KEY);
+        getmessage(&msg, EM_KEY);
 
-        if (ch == 27) {
-            /* Esc 返回 */
-            break;
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.vkcode == VK_ESCAPE) break;
 
-        } else if (ch == 'a' || ch == 'A') {
-            /* 添加新车型 */
-            Car new_car;
-            if (*car_count >= MAX_CARS) {
-                ui_begin_frame();
-                settextstyle(22, 0, "宋体");
-                settextcolor(RGB(255, 100, 100));
-                outtextxy(WIN_WIDTH/2 - 120, WIN_HEIGHT/2, "车型库已满，无法添加");
-                wait_any_key(NULL);
-                continue;
-            }
-            if (ui_input_car(&new_car)) {
-                car_add(cars, car_count, new_car);
-            }
+            if (msg.vkcode == 'A') {
+                Car new_car;
+                if (*car_count >= MAX_CARS) {
+                    ui_begin_frame();
+                    settextstyle(22, 0, "宋体");
+                    settextcolor(RGB(255, 100, 100));
+                    outtextxy(WIN_WIDTH/2 - 120, WIN_HEIGHT/2, "车型库已满，无法添加");
+                    wait_any_key(NULL);
+                    continue;
+                }
+                if (ui_input_car(&new_car))
+                    car_add(cars, car_count, new_car);
 
-        } else if (ch == 'd' || ch == 'D') {
-            /* 删除车型 */
-            if (*car_count == 0) continue;
+            } else if (msg.vkcode == 'D') {
+                int del_idx;
+                if (*car_count == 0) continue;
 
-            del_idx = ui_select_car(cars, *car_count);
-            if (del_idx >= 0) {
-                /* 二次确认 */
-                ui_begin_frame();
-                settextstyle(22, 0, "宋体");
-                settextcolor(RGB(255, 180, 50));
-                snprintf(buf, sizeof(buf),
-                         "确认删除 [%s] ?   Enter=确认   其它键=取消",
-                         cars[del_idx].name);
-                outtextxy(50, WIN_HEIGHT / 2, buf);
-                FlushBatchDraw();
+                del_idx = ui_select_car(cars, *car_count);
+                if (del_idx >= 0) {
+                    ExMessage cmsg;
+                    ui_begin_frame();
+                    settextstyle(22, 0, "宋体");
+                    settextcolor(RGB(255, 180, 50));
+                    snprintf(buf, sizeof(buf),
+                             "确认删除 [%s] ?   Enter=确认   其它键=取消",
+                             cars[del_idx].name);
+                    outtextxy(50, WIN_HEIGHT / 2, buf);
+                    FlushBatchDraw();
 
-                if (_getch() == 13)
-                    car_delete(cars, car_count, del_idx);
+                    flushmessage(EM_KEY);
+                    getmessage(&cmsg, EM_KEY);
+                    if (cmsg.message == WM_KEYDOWN && cmsg.vkcode == VK_RETURN)
+                        car_delete(cars, car_count, del_idx);
+                }
             }
         }
-        /* 其它按键忽略，重绘菜单 */
+        /* 其它消息类型（WM_CHAR 等）忽略，重绘菜单 */
     }
 }

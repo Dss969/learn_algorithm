@@ -1,15 +1,14 @@
 /*
  * ui.c  —  EasyX 界面绘制实现
  *
- * 编译要求：Windows + EasyX安装包
- * 字符编码：UTF-8（VS用户需在项目属性中添加 /utf-8 编译选项）
+ * 编译要求：Windows + EasyX；必须以 C++ 模式编译（g++ -x c++ 或 VS /TP）
+ * 字符编码：源文件 UTF-8，MinGW 编译加 -fexec-charset=GBK 转换字符串字面量
  */
 #include "ui.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <conio.h>     /* _getch() */
 #include <windows.h>   /* Sleep(), SetWindowText() */
 
 #define PI 3.14159265f
@@ -37,15 +36,21 @@ static void angle_to_xy(int cx, int cy, float r, float deg, int *px, int *py)
  * 在 EasyX 窗口中读入一行 ASCII 字符串（带光标回显）
  * 入参: buf 缓冲区, maxlen 最大字符数, (x,y) 输入框屏幕坐标
  * 按 Enter 确认，Esc 将 buf 置空并返回
+ *
+ * 使用 EasyX getmessage() 从图形窗口消息队列读键，而非 _getch()。
+ * _getch() 读控制台缓冲区，EasyX 默认隐藏控制台后该缓冲区不再接收事件。
  */
 static void read_string(char *buf, int maxlen, int x, int y)
 {
-    int pos = 0;
-    int ch;
-    char tmp[512];
+    int      pos  = 0;
+    int      done = 0;
+    char     tmp[512];
+    ExMessage msg;
 
     buf[0] = '\0';
-    while (1) {
+    flushmessage(EM_KEY);   /* 清空队列中残留的按键事件 */
+
+    while (!done) {
         /* 清除当行输入区并重绘 */
         setfillcolor(RGB(30, 30, 50));
         solidrectangle(x, y, x + 460, y + 30);
@@ -55,13 +60,18 @@ static void read_string(char *buf, int maxlen, int x, int y)
         outtextxy(x + 4, y + 4, tmp);
         FlushBatchDraw();
 
-        ch = _getch();
-        if (ch == 13)          break;                  /* Enter 确认 */
-        if (ch == 27)        { buf[0] = '\0'; return; } /* Esc 取消 */
-        if (ch == 8 && pos > 0) { buf[--pos] = '\0'; }  /* Backspace */
-        else if (ch >= 32 && pos < maxlen - 1) {
-            buf[pos++] = (char)ch;
-            buf[pos]   = '\0';
+        getmessage(&msg, EM_KEY);   /* 阻塞直到有按键事件 */
+
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.vkcode == VK_RETURN)               done = 1;
+            else if (msg.vkcode == VK_ESCAPE)        { buf[0] = '\0'; done = 1; }
+            else if (msg.vkcode == VK_BACK && pos > 0) buf[--pos] = '\0';
+        } else if (msg.message == WM_CHAR) {
+            /* WM_CHAR 携带可打印字符，ASCII 32-126 均可录入 */
+            if (msg.ch >= 32 && msg.ch < 127 && pos < maxlen - 1) {
+                buf[pos++] = (char)msg.ch;
+                buf[pos]   = '\0';
+            }
         }
     }
 }
@@ -116,10 +126,11 @@ void ui_end_frame(void)
 
 int ui_main_menu(void)
 {
-    int i, key;
+    int i;
     int y0 = 235;
     COLORREF clrs[5];
     const char *lines[5];
+    ExMessage msg;
 
     clrs[0] = RGB(100, 200, 255);
     clrs[1] = RGB(100, 255, 150);
@@ -164,16 +175,24 @@ int ui_main_menu(void)
 
     ui_end_frame();
 
-    /* 阻塞等待按键 */
+    /*
+     * 阻塞等待按键。
+     * 使用 getmessage() 读 EasyX 图形窗口消息队列，而非 _getch()。
+     * WM_CHAR 消息携带字符值（msg.ch），WM_KEYDOWN 携带虚拟键码（msg.vkcode）。
+     */
+    flushmessage(EM_KEY);
     while (1) {
-        key = _getch();
-        switch (key) {
-            case '1': return 1;
-            case '2': return 2;
-            case '3': return 3;
-            case '4': return 4;
-            case '0': case 27: return 0;
-            default:  break;
+        getmessage(&msg, EM_KEY);
+        if (msg.message == WM_KEYDOWN && msg.vkcode == VK_ESCAPE) return 0;
+        if (msg.message == WM_CHAR) {
+            switch (msg.ch) {
+                case '1': return 1;
+                case '2': return 2;
+                case '3': return 3;
+                case '4': return 4;
+                case '0': return 0;
+                default:  break;
+            }
         }
     }
 }
@@ -198,7 +217,7 @@ void ui_draw_speedometer(float speed_kmh, float rpm, int cx, int cy, int radius)
     /*
      * --- 刻度线 ---
      * 0 km/h 对应 225°（左下），260 km/h 对应 -45°（右下）
-     * 顺时针走过 270°圆弧
+     * 顺时针走过 270° 圆弧
      */
     for (i = 0; i <= 26; i++) {
         float v   = (float)i * 10.0f;
@@ -296,7 +315,13 @@ void ui_draw_car_side(int x, int y, COLORREF color)
 /* 跑道背景                                                             */
 /* ================================================================ */
 
-void ui_draw_track(int x, int y, int w, int h)
+/*
+ * dash_offset: 中心虚线的起始偏移（像素）。
+ * 加速测试中每帧递增该值，使路面虚线向左流动，
+ * 视觉上表现为车辆向右行驶，车身可固定在屏幕左侧。
+ * 静止画面（制动等）传 0 即可。
+ */
+void ui_draw_track(int x, int y, int w, int h, int dash_offset)
 {
     int i;
     int road_top = y + h / 2 - 35;
@@ -311,15 +336,26 @@ void ui_draw_track(int x, int y, int w, int h)
     setfillcolor(RGB(55, 55, 65));
     solidrectangle(x, road_top, x + w, road_bot);
 
-    /* 边芒草地 */
+    /* 边侧草地 */
     setfillcolor(RGB(25, 70, 25));
     solidrectangle(x, road_bot, x + w, y + h);
 
-    /* 中心虚线（每 40px 画 20px线段） */
+    /*
+     * 中心虚线（每 40px 一个周期：画 22px 线段 + 18px 空白）
+     * 起点从 (x - dash_offset % 40) 开始，保证滚动时无跳变。
+     */
     setlinecolor(RGB(240, 230, 90));
     setlinestyle(PS_SOLID, 2);
-    for (i = x; i < x + w; i += 40)
-        line(i, mid_y, i + 22, mid_y);
+    {
+        int start = x - (dash_offset % 40);
+        for (i = start; i < x + w; i += 40) {
+            int x1 = i,      x2 = i + 22;
+            if (x2 < x) continue;          /* 整段在左边界外，跳过 */
+            if (x1 < x) x1 = x;           /* 裁剪左边界 */
+            if (x2 > x + w) x2 = x + w;  /* 裁剪右边界 */
+            line(x1, mid_y, x2, mid_y);
+        }
+    }
 }
 
 /* ================================================================ */
@@ -403,20 +439,35 @@ void ui_draw_vt_curve(float v_arr[], int count, float dt, COLORREF color,
                       int ox, int oy, int w, int h)
 {
     float max_t  = (float)(count - 1) * dt;
-    float max_v  = 40.0f;    /* Y 轴上限 40 m/s ≈ 144 km/h */
-    int   ref_y;
+    float max_v_ms;
+    int   k, ticks, ref_y;
 
-    draw_axes("t/s", "v/(m/s)", max_t, max_v, ox, oy, w, h);
-    draw_polyline(v_arr, count, dt, max_v, color, ox, oy, w, h);
+    /*
+     * Y 轴自动缩放：找出最大速度，向上取整到 20 km/h 的倍数。
+     * 固定上限的问题：低功率车（宏光 MINI）极速 ~90 km/h，若硬写 144 km/h
+     * 则曲线压缩在下半部；高功率车若极速 >144 km/h 则曲线超出顶部被截断。
+     */
+    max_v_ms = 0.0f;
+    for (k = 0; k < count; k++)
+        if (v_arr[k] > max_v_ms) max_v_ms = v_arr[k];
 
-    /* 100 km/h 参考红虹线 */
-    ref_y = oy - (int)(27.78f / max_v * (float)h);
-    setlinecolor(RGB(255, 90, 90));
-    setlinestyle(PS_DASH, 1);
-    line(ox, ref_y, ox + w, ref_y);
-    settextstyle(13, 0, "宋体");
-    settextcolor(RGB(255, 90, 90));
-    outtextxy(ox + 4, ref_y - 17, "100 km/h");
+    ticks = (int)(max_v_ms * 3.6f / 20.0f) + 1;   /* 向上取整到下一个 20 km/h 格 */
+    if (ticks < 2) ticks = 2;                        /* 最少 2 格（避免零除） */
+    max_v_ms = (float)ticks * 20.0f / 3.6f;         /* 转回 m/s 作为 Y 轴上限 */
+
+    draw_axes("t/s", "v/(m/s)", max_t, max_v_ms, ox, oy, w, h);
+    draw_polyline(v_arr, count, dt, max_v_ms, color, ox, oy, w, h);
+
+    /* 100 km/h 参考红虚线（仅当 100 km/h 在 Y 轴范围内时绘制） */
+    if (27.78f <= max_v_ms) {
+        ref_y = oy - (int)(27.78f / max_v_ms * (float)h);
+        setlinecolor(RGB(255, 90, 90));
+        setlinestyle(PS_DASH, 1);
+        line(ox, ref_y, ox + w, ref_y);
+        settextstyle(13, 0, "宋体");
+        settextcolor(RGB(255, 90, 90));
+        outtextxy(ox + 4, ref_y - 17, "100 km/h");
+    }
 }
 
 /* ================================================================ */
@@ -517,10 +568,13 @@ void ui_draw_comparison_table(Car cars[], float t100[], float brake_dist[],
 int ui_select_car(Car cars[], int count)
 {
     int sel = 0;
-    int ch, i;
+    int i;
     char info[128];
+    ExMessage msg;
 
     if (count <= 0) return -1;
+
+    flushmessage(EM_KEY);
 
     while (1) {
         ui_begin_frame();
@@ -558,16 +612,17 @@ int ui_select_car(Car cars[], int count)
 
         ui_end_frame();
 
-        /* 按键处理：扩展键先读 0xE0，再读具体键码 */
-        ch = _getch();
-        if (ch == 0 || ch == 0xE0) {
-            ch = _getch();
-            if (ch == 72 && sel > 0)           sel--;   /* ↑ */
-            if (ch == 80 && sel < count - 1)   sel++;   /* ↓ */
-        } else if (ch == 13) {
-            return sel;
-        } else if (ch == 27) {
-            return -1;
+        /*
+         * 非阻塞轮询：peekmessage 第三参 1 表示读完即从队列移除。
+         * 放在帧循环内，每帧处理所有积压按键后继续重绘。
+         */
+        while (peekmessage(&msg, EM_KEY, 1)) {
+            if (msg.message == WM_KEYDOWN) {
+                if (msg.vkcode == VK_UP   && sel > 0)         sel--;
+                if (msg.vkcode == VK_DOWN && sel < count - 1) sel++;
+                if (msg.vkcode == VK_RETURN) { flushmessage(EM_KEY); return sel; }
+                if (msg.vkcode == VK_ESCAPE) { flushmessage(EM_KEY); return -1; }
+            }
         }
     }
 }
@@ -578,15 +633,12 @@ int ui_select_car(Car cars[], int count)
 
 int ui_input_car(Car *out)
 {
-    /*
-     * 逐字段在 EasyX 窗口内输入参数。
-     * 车型名仅支持 ASCII（英文/拼音），Enter 确认每字段。
-     */
     int lx  = WIN_WIDTH / 2 - 320;
     int vx  = WIN_WIDTH / 2 + 20;
     int y0  = 90;
     int dy  = 52;
     char buf[64];
+    ExMessage msg;
 
     memset(out, 0, sizeof(Car));
 
@@ -600,7 +652,6 @@ int ui_input_car(Car *out)
     outtextxy(lx, 68, "依次填写各字段，Enter 确认，Esc 取消当前字段输入");
 
     {
-        /* 定义每一行的标签和单位提示 */
         const char *labels[9] = {
             "车型名称：",
             "额定功率 (kW)：",
@@ -613,7 +664,7 @@ int ui_input_car(Car *out)
             "制动减速度 (m/s2)："
         };
         const char *hints[9] = {
-            "为 0 取消 / 小于32个字符",
+            "小于 32 个字符",
             "e.g. 180",
             "e.g. 320",
             "e.g. 1400",
@@ -657,8 +708,7 @@ int ui_input_car(Car *out)
     outtextxy(lx, WIN_HEIGHT / 2, buf);
     FlushBatchDraw();
 
-    {
-        int ch = _getch();
-        return (ch == 13) ? 1 : 0;
-    }
+    flushmessage(EM_KEY);
+    getmessage(&msg, EM_KEY);
+    return (msg.message == WM_KEYDOWN && msg.vkcode == VK_RETURN) ? 1 : 0;
 }
